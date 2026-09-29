@@ -902,16 +902,13 @@ def get_max_concurrency_for_kv_cache_config(
             kv_cache_config.kv_cache_groups,
             key=lambda g: g.kv_cache_spec.page_size_bytes,
         )
-        bundle_page = dsa_bundle_page_size_bytes(
-            latent_group.kv_cache_spec.page_size_bytes,
-            indexer_group.kv_cache_spec.page_size_bytes,
+        layout = dsa_shared_block_layout(
+            latent_group.kv_cache_spec,
+            indexer_group.kv_cache_spec,
+            prefill_child=layerwise_prefill_p_node_enabled(),
         )
-        latent_blocks_per_bundle = (
-            bundle_page // latent_group.kv_cache_spec.page_size_bytes
-        )
-        indexer_blocks_per_bundle = (
-            bundle_page // indexer_group.kv_cache_spec.page_size_bytes
-        )
+        latent_blocks_per_bundle = layout.latent_blocks_per_bundle
+        indexer_blocks_per_bundle = layout.indexer_blocks_per_bundle
         mode = dsa_kv_residency_mode()
         if mode != "prefill_child":
             # Preserve ordinary/D-node admission: the shared bundle pool is
@@ -1362,11 +1359,7 @@ def get_kv_cache_config_from_groups(
             layout = dsa_shared_block_layout(
                 latent_group.kv_cache_spec,
                 indexer_group.kv_cache_spec,
-                bundle_multiplier=(
-                    layerwise_prefill_bundle_multiplier()
-                    if residency_mode == "prefill_child"
-                    else 1
-                ),
+                prefill_child=residency_mode == "prefill_child",
             )
             latent_page = layout.latent_page_size_bytes
             indexer_page = layout.indexer_page_size_bytes
@@ -1387,15 +1380,15 @@ def get_kv_cache_config_from_groups(
                 latent_layers, indexer_layers
             )
             if residency_mode == "prefill_child":
-                if layout.indexer_scale_page_size_bytes:
-                    raise ValueError(
-                        "layerwise prefill P-node does not yet support C8 "
-                        "indexer scale sidecars"
-                    )
-                total_bundle_slots = available_memory // bundle_page
-                natural_bundles = (
-                    total_bundle_slots - 1
-                ) // latent_layers
+                # P-node payloads include one scale sidecar per physical bundle.
+                # Charge the aligned backing before deriving the parent capacity;
+                # the old guard incorrectly rejected the supported mixed-C8 path.
+                bundle_bytes = (
+                    layout.bundle_page_size_bytes + layout.scale_bytes_per_bundle
+                )
+                backing_overhead = layout.backing_alignment_bytes
+                slot_count = (available_memory - backing_overhead) // bundle_bytes
+                natural_bundles = (slot_count - 1) // latent_layers
             else:
                 slot_count = (available_memory - backing_overhead) // bundle_bytes
                 natural_bundles = slot_count - 1
@@ -1446,15 +1439,17 @@ def get_kv_cache_config_from_groups(
                 natural_nonshared_blocks,
             )
             tensor_size = (num_bundles + 1) * bundle_page
-            if residency_mode == "prefill_child":
-                shared_pool_bytes = (
-                    latent_layers * num_bundles + 1
-                ) * bundle_page
-            else:
-                shared_pool_bytes = (num_bundles + 1) * bundle_bytes
-                shared_pool_bytes += backing_overhead
+            payload_slots = (
+                latent_layers * num_bundles + 1
+                if residency_mode == "prefill_child"
+                else num_bundles + 1
+            )
+            shared_pool_bytes = payload_slots * bundle_bytes + backing_overhead
             if (
-                layout.indexer_scale_page_size_bytes
+                (
+                    layout.indexer_scale_page_size_bytes
+                    or residency_mode == "prefill_child"
+                )
                 and not for_profiling
                 and shared_pool_bytes > available_memory
             ):
@@ -1573,7 +1568,7 @@ def get_kv_cache_config_from_groups(
                     )
                 kv_cache_tensors = [
                     KVCacheTensor(
-                        size=shared_pool_bytes,
+                        size=shared_pool_bytes - backing_overhead,
                         shared_by=ordered_shared_layers,
                     )
                 ]
@@ -1987,16 +1982,13 @@ def _report_kv_cache_config(
             kv_cache_config.kv_cache_groups,
             key=lambda g: g.kv_cache_spec.page_size_bytes,
         )
-        bundle_page = dsa_bundle_page_size_bytes(
-            latent_group.kv_cache_spec.page_size_bytes,
-            indexer_group.kv_cache_spec.page_size_bytes,
+        layout = dsa_shared_block_layout(
+            latent_group.kv_cache_spec,
+            indexer_group.kv_cache_spec,
+            prefill_child=layerwise_prefill_p_node_enabled(),
         )
-        latent_blocks_per_bundle = (
-            bundle_page // latent_group.kv_cache_spec.page_size_bytes
-        )
-        indexer_blocks_per_bundle = (
-            bundle_page // indexer_group.kv_cache_spec.page_size_bytes
-        )
+        latent_blocks_per_bundle = layout.latent_blocks_per_bundle
+        indexer_blocks_per_bundle = layout.indexer_blocks_per_bundle
         mode = dsa_kv_residency_mode()
         if mode == "prefill_child":
             child_capacity = kv_cache_config.num_blocks * len(
@@ -2093,19 +2085,11 @@ def _max_memory_usage_bytes_from_groups(
             layout = dsa_shared_block_layout(
                 latent_group.kv_cache_spec,
                 indexer_group.kv_cache_spec,
-                bundle_multiplier=(
-                    layerwise_prefill_bundle_multiplier()
-                    if residency_mode == "prefill_child"
-                    else 1
-                ),
+                prefill_child=residency_mode == "prefill_child",
             )
             bundle_page = layout.bundle_page_size_bytes
-            latent_blocks_per_bundle = (
-                bundle_page // latent_group.kv_cache_spec.page_size_bytes
-            )
-            indexer_blocks_per_bundle = (
-                bundle_page // indexer_group.kv_cache_spec.page_size_bytes
-            )
+            latent_blocks_per_bundle = layout.latent_blocks_per_bundle
+            indexer_blocks_per_bundle = layout.indexer_blocks_per_bundle
             if residency_mode == "prefill_child":
                 bundles = dsa_required_bundles(
                     residency_mode,
@@ -2115,7 +2099,14 @@ def _max_memory_usage_bytes_from_groups(
                     latent_blocks_per_bundle=latent_blocks_per_bundle,
                     indexer_blocks_per_bundle=indexer_blocks_per_bundle,
                 )
-                return (bundles + 1) * bundle_page
+                # Parents materialize complete layer-slot ranges, even when a
+                # request needs only part of the final parent's children.
+                layer_slots = len(latent_group.layer_names)
+                allocated_slots = cdiv(bundles, layer_slots) * layer_slots + 1
+                return (
+                    allocated_slots * (bundle_page + layout.scale_bytes_per_bundle)
+                    + layout.backing_alignment_bytes
+                )
             blocks = cdiv(
                 latent_group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
                 latent_group.kv_cache_spec.page_size_bytes,
@@ -2445,32 +2436,39 @@ def get_kv_cache_configs(
             num_blocks_old = kv_cache_config.num_blocks
             if num_blocks_old != min_num_blocks:
                 kv_cache_config.num_blocks = min_num_blocks
-                if kv_cache_config.dsa_paired_bank_slots:
-                    kv_cache_config.dsa_paired_bank_slots = min_num_blocks + 1
                 if layerwise_prefill_p_node_enabled():
+                    # Layerwise prefill uses one global slab containing one
+                    # null bundle plus one child-bundle range per layer pair:
+                    #   (num_layer_pairs * num_bundles + 1) * bundle_page
+                    # It therefore cannot be shrunk using the regular
+                    # per-layer (num_bundles + 1) tensor layout below.
                     assert len(kv_cache_config.kv_cache_tensors) == 1
                     latent_group = max(
                         kv_cache_config.kv_cache_groups,
                         key=lambda g: g.kv_cache_spec.page_size_bytes,
                     )
+                    num_layer_pairs = len(latent_group.layer_names)
                     indexer_group = min(
                         kv_cache_config.kv_cache_groups,
                         key=lambda g: g.kv_cache_spec.page_size_bytes,
                     )
-                    bundle_page = dsa_bundle_page_size_bytes(
-                        latent_group.kv_cache_spec.page_size_bytes,
-                        indexer_group.kv_cache_spec.page_size_bytes,
+                    layout = dsa_shared_block_layout(
+                        latent_group.kv_cache_spec,
+                        indexer_group.kv_cache_spec,
+                        prefill_child=True,
                     )
-                    num_layer_pairs = len(latent_group.layer_names)
+                    bundle_page = (
+                        layout.bundle_page_size_bytes + layout.scale_bytes_per_bundle
+                    )
                     tensor = kv_cache_config.kv_cache_tensors[0]
                     expected_old_size = (
                         num_layer_pairs * num_blocks_old + 1
                     ) * bundle_page
                     assert tensor.size == expected_old_size
-                    tensor.size = (
-                        num_layer_pairs * min_num_blocks + 1
-                    ) * bundle_page
+                    tensor.size = (num_layer_pairs * min_num_blocks + 1) * bundle_page
                 else:
+                    if kv_cache_config.dsa_paired_bank_slots:
+                        kv_cache_config.dsa_paired_bank_slots = min_num_blocks + 1
                     for tensor in kv_cache_config.kv_cache_tensors:
                         assert tensor.size % (num_blocks_old + 1) == 0
                         tensor.size = tensor.size // (num_blocks_old + 1) * (
